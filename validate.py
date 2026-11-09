@@ -78,9 +78,10 @@ if PROFILE == 'sanitizer':
 run('configure', options)
 run('configuration', ['perl', 'configdata.pm', '--dump'])
 run('build', ['make', '-s', '-j4'], timeout=3000)
-run('library-identity', ['sha256sum', 'libssl.so', 'libcrypto.so', 'test/quic_stream_test',
+run('library-identity', ['sha256sum', 'libssl.a', 'libcrypto.a', 'libssl.so', 'libcrypto.so', 'test/quic_stream_test',
                          'test/quic_txp_test', 'test/quic_fifd_test', 'test/quicapitest'])
 run('runtime-dependencies', ['ldd', 'libssl.so'])
+run('test-runtime-dependencies', ['ldd', 'test/quic_stream_test'])
 
 cases = [
     ('quic_stream_test', 'test_stream_map_gc_states'),
@@ -110,6 +111,9 @@ sources = {p: (ROOT / p).read_text() for p in (
     'ssl/quic/quic_rx_depack.c', 'ssl/quic/quic_fifd.c', 'ssl/quic/quic_txp.c')}
 (OUT / 'candidate-diff.patch').write_bytes(subprocess.check_output(['git', 'diff', BASE, 'HEAD']))
 candidate_library_sha = hashlib.sha256((ROOT / 'libssl.so').read_bytes()).hexdigest()
+candidate_archive_sha = hashlib.sha256((ROOT / 'libssl.a').read_bytes()).hexdigest()
+candidate_binaries = {program: hashlib.sha256((ROOT / 'test' / program).read_bytes()).hexdigest()
+                      for program in {p for p, _ in cases}}
 if PROFILE == 'normal':
     variants = [
         ('gc-admission', 'quic_stream_test', 'test_stream_map_gc_states', 1,
@@ -182,14 +186,25 @@ if PROFILE == 'normal':
             delta = subprocess.check_output(['git', 'diff'])
             assert delta
             (OUT / ('negative-' + label + '.patch')).write_bytes(delta)
+            # These upstream test programs link libssl.a, even in a shared
+            # library configuration. Rebuilding only libssl.so is insufficient.
             run('rebuild-' + label, ['make', '-s', '-j4', 'build_libs'], timeout=900)
+            run('relink-' + label, ['make', '-s', 'test/' + program], timeout=900)
             library_sha = hashlib.sha256((ROOT / 'libssl.so').read_bytes()).hexdigest()
             assert library_sha != candidate_library_sha
+            archive_sha = hashlib.sha256((ROOT / 'libssl.a').read_bytes()).hexdigest()
+            binary_sha = hashlib.sha256((ROOT / 'test' / program).read_bytes()).hexdigest()
+            assert archive_sha != candidate_archive_sha
+            assert binary_sha != candidate_binaries[program]
             text = run('negative-' + label, test_args(program, name, iteration),
                        timeout=180, expected=1, marker=marker)
             check_iteration(text, iteration, failed=True)
             controls.append({'variant': label, 'library_sha256': library_sha,
                              'candidate_library_sha256': candidate_library_sha,
+                             'archive_sha256': archive_sha,
+                             'candidate_archive_sha256': candidate_archive_sha,
+                             'executed_test_sha256': binary_sha,
+                             'candidate_test_sha256': candidate_binaries[program],
                              'delta_sha256': hashlib.sha256(delta).hexdigest(),
                              'test': name, 'iteration': iteration, 'specified_failure': marker})
     finally:
@@ -197,11 +212,18 @@ if PROFILE == 'normal':
             (ROOT / p).write_text(text)
     (OUT / 'negative-controls.json').write_text(json.dumps(controls, indent=2) + '\n')
     run('restore-candidate-build', ['make', '-s', '-j4', 'build_libs'], timeout=900)
+    run('restore-candidate-tests', ['make', '-s',
+                                  *['test/' + p for p in sorted(candidate_binaries)]], timeout=900)
     assert hashlib.sha256((ROOT / 'libssl.so').read_bytes()).hexdigest() == candidate_library_sha
+    assert hashlib.sha256((ROOT / 'libssl.a').read_bytes()).hexdigest() == candidate_archive_sha
+    for program, expected_sha in candidate_binaries.items():
+        assert hashlib.sha256((ROOT / 'test' / program).read_bytes()).hexdigest() == expected_sha
     for program, name in cases:
         run('restored-' + name, test_args(program, name), timeout=180)
 assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip()
 (OUT / 'verified.json').write_text(json.dumps({'accepted': True, 'profile': PROFILE,
     'source': head, 'baseline': BASE, 'candidate_libssl_sha256': candidate_library_sha,
+    'candidate_static_archive_sha256': candidate_archive_sha,
+    'executed_test_binaries_sha256': candidate_binaries,
     'mandatory_positive_groups': len(cases), 'negative_variants': 8 if PROFILE == 'normal' else 0,
     'full_quic_recipes': True, 'options': options, 'commands': len(history)}, indent=2) + '\n')
