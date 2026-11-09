@@ -1,0 +1,53 @@
+name: QUIC upstream qualification
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  native:
+    name: Native ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [normal, debug, sanitizer]
+    env:
+      CANDIDATE: ${{ inputs.candidate }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: driver
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidate }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Qualify exact native candidate
+        working-directory: source
+        run: python3 ../driver/validate.py '${{ matrix.profile }}'
+      - name: Capture test diagnostics
+        if: always()
+        run: |
+          mkdir -p evidence
+          python3 - <<'PY'
+          import pathlib,tarfile
+          root=pathlib.Path('source/test-runs')
+          with tarfile.open('evidence/test-runs.tar.gz','w:gz') as out:
+              if root.exists():
+                  for p in root.rglob('*'):
+                      if p.is_file() and p.name.endswith(('.log','.tap','.txt')) and p.stat().st_size<16*1024*1024:
+                          out.add(p)
+          PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: openssl-quic-${{ matrix.profile }}
+          path: evidence/
+          retention-days: 7
