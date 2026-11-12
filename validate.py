@@ -89,14 +89,18 @@ cases = [
     ('quic_stream_test', 'test_stream_map_gc_retire_error'),
     ('quic_stream_test', 'test_stream_gc_receive_progress'),
     ('quic_stream_test', 'test_stream_gc_receive_guards'),
+    ('quic_stream_test', 'test_stream_gc_stream_credit'),
     ('quic_fifd_test', 'test_fifd'),
     ('quic_txp_test', 'test_control_frame_loss'),
     ('quic_txp_test', 'test_reset_ack_loss_order'),
     ('quicapitest', 'test_stream_gc_connection_credit'),
+    ('quicapitest', 'test_reject_stream_gc'),
 ]
 expected_iterations = {'test_stream_map_gc_states': 15,
+                       'test_stream_map_gc_retire_error': 2,
                        'test_stream_gc_receive_progress': 4,
                        'test_stream_gc_receive_guards': 2,
+                       'test_stream_gc_stream_credit': 4,
                        'test_fifd': 7, 'test_reset_ack_loss_order': 3}
 for program, name in cases:
     text = run('positive-' + name, test_args(program, name), timeout=180)
@@ -132,6 +136,10 @@ if PROFILE == 'normal':
          's->want_reset_stream'),
         ('reset-queued-ack', 'quic_txp_test', 'test_reset_ack_loss_order', 2,
          's->want_reset_stream'),
+        ('accept-stream-credit', 'quic_stream_test', 'test_stream_gc_stream_credit', 1,
+         'ossl_quic_rxfc_get_rwm(count)'),
+        ('reject-stream-credit', 'quic_stream_test', 'test_stream_gc_stream_credit', 3,
+         'ossl_quic_rxfc_get_rwm(count)'),
     ]
     controls = []
     try:
@@ -152,13 +160,13 @@ if PROFILE == 'normal':
             elif label == 'unread-byte-credit':
                 p = 'ssl/quic/quic_stream_map.c'
                 text = sources[p].replace('    uint64_t swm, rwm;\n', '', 1)
-                pattern = r'        if \(ossl_quic_stream_has_recv\(qs\)\) \{\n.*?\n        \}\n(?=        ossl_quic_stream_map_release)'
+                pattern = r'        if \(ossl_quic_stream_has_recv\(qs\)\) \{\n.*?\n        \}\n'
                 text, count = re.subn(pattern, '', text, count=1, flags=re.S)
                 assert count == 1
                 (ROOT / p).write_text(text)
             elif label == 'gc-before-tx':
                 p = 'ssl/quic/quic_channel.c'
-                begin = sources[p].index('        /* No packetiser stream pointers')
+                begin = sources[p].index('        ossl_statm_get_rtt_info(ossl_quic_channel_get_statm(ch), &rtt_info);\n')
                 end = sources[p].index('        /* Queue any data', begin)
                 block = sources[p][begin:end]
                 text = sources[p][:begin] + sources[p][end:]
@@ -178,11 +186,24 @@ if PROFILE == 'normal':
                 needle = 's == NULL || s->send_state != QUIC_SSTREAM_STATE_RESET_SENT'
                 assert sources[p].count(needle) == 1
                 (ROOT / p).write_text(sources[p].replace(needle, 's == NULL', 1))
-            else:
+            elif label == 'reset-queued-ack':
                 p = 'ssl/quic/quic_stream_map.c'
                 needle = '        qs->want_reset_stream = 0;\n'
                 assert sources[p].count(needle) == 1
                 (ROOT / p).write_text(sources[p].replace(needle, '', 1))
+            elif label == 'accept-stream-credit':
+                p = 'ssl/quic/quic_stream_map.c'
+                needle = '        --qsm->num_accept_uni;\n'
+                assert sources[p].count(needle) == 1
+                (ROOT / p).write_text(sources[p].replace(needle, needle +
+                    '    (void)ossl_quic_rxfc_on_retire(qsm_get_max_streams_rxfc(qsm, s), 1, ossl_time_zero());\n', 1))
+            else:
+                assert label == 'reject-stream-credit'
+                p = 'ssl/quic/quic_channel.c'
+                needle = '    qs->deleted = 1;\n'
+                assert sources[p].count(needle) == 1
+                (ROOT / p).write_text(sources[p].replace(needle, needle +
+                    '    (void)ossl_quic_rxfc_on_retire(ossl_quic_stream_is_bidi(qs) ? &ch->max_streams_bidi_rxfc : &ch->max_streams_uni_rxfc, 1, ossl_time_zero());\n', 1))
             delta = subprocess.check_output(['git', 'diff'])
             assert delta
             (OUT / ('negative-' + label + '.patch')).write_bytes(delta)
